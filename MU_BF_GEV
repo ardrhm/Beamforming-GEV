@@ -2,9 +2,9 @@ function R = MU_BF_GEV(Pin)
 P = getDefaultParams();
 if nargin>0, P = overrideParams(P,Pin); end
 if ~isempty(P.seed), rng(P.seed,'twister'); end
-assert(numel(P.Pu)==P.U,'Length of Pu must equal P.U');
-assert(numel(P.Pi)==P.I,'Length of Pi must equal P.I');
-assert(P.desiredUserIdx>=1 && P.desiredUserIdx<=P.U,'desiredUserIdx out of range');
+assert(numel(P.Pu)==P.U);
+assert(numel(P.Pi)==P.I);
+assert(P.desiredUserIdx>=1 && P.desiredUserIdx<=P.U);
 rngState = rng;
 [Rs,Ri] = computeCovMatrices(P);
 rng(rngState);
@@ -66,12 +66,12 @@ Rs = Pu(idx)*(Smp*diag(baseP)*Smp');
 Ri = zeros(N);
 otherU = setdiff(1:P.U,idx);
 for u = otherU
-    ths = P.theta_users_deg(u) + P.pathAngleStd*randn(P.numPaths,1);
+    ths = P.theta_users_deg(u) + P.angleStdUser*randn(P.numPaths,1);
     for p=1:P.numPaths, Smp(:,p) = steeringVector(ths(p),N,P.d,P.lambda); end
     Ri = Ri + Pu(u)*(Smp*diag(baseP)*Smp');
 end
 for k=1:P.I
-    ths = P.theta_interfs_deg(k) + P.pathAngleStd*randn(P.numPaths,1);
+    ths = P.theta_interfs_deg(k) + P.angleStdInt*randn(P.numPaths,1);
     for p=1:P.numPaths, Smp(:,p) = steeringVector(ths(p),N,P.d,P.lambda); end
     Ri = Ri + Pi(k)*(Smp*diag(baseP)*Smp');
 end
@@ -93,7 +93,8 @@ if N<=200
     [~,ix] = max(real(D));
     w = V(:,ix);
 else
-    w = eigs(Rs,Rin,1,'largestreal');
+    opts.isreal = true; opts.issym = true;
+    w = eigs(Rs,Rin,1,'lr',opts);
 end
 w = w/norm(w);
 end
@@ -103,10 +104,12 @@ N = P.N; U = P.U; I = P.I; L = P.iter; idx = P.desiredUserIdx;
 sinr_all = nan(L,1);
 sinr_users = nan(U,L);
 C = eye(N) + P.couplingCoeff*(diag(ones(N-1,1),1)+diag(ones(N-1,1),-1));
-if P.showProg, fprintf('Progress:   0%%'); end
 step = max(1,round(L/20));
 for t=1:L
-    if P.showProg && (t==1 || t==L || mod(t,step)==0), fprintf('\rProgress: %3.0f%%',100*t/L); end
+    if P.showProg && (t==1 || t==L || mod(t,step)==0)
+        fprintf('\rProgress: %3.0f%%',100*t/L);
+        if t==L, fprintf('\n'); end
+    end
     th_u = P.theta_users_deg + P.angleStdUser*randn(1,U);
     th_i = P.theta_interfs_deg + P.angleStdInt*randn(1,I);
     Hu = zeros(N,U); Hi = zeros(N,I);
@@ -116,7 +119,7 @@ for t=1:L
     sig     = P.Pu(idx)*abs(w'*Sd)^2;
     interfU = sum(P.Pu(setdiff(1:U,idx)) .* abs(w'*Hu(:,setdiff(1:U,idx))).^2);
     interfI = sum(P.Pi .* abs(w'*Hi).^2);
-    sigma_n = P.sigma2 * max(1 + P.noiseJitterFrac*randn(), 0);
+    sigma_n = max(P.sigma2 * (1 + P.noiseJitterFrac*randn()), 1e-12);
     sinr_all(t) = sig/(interfU + interfI + sigma_n);
     for u=1:U
         interferers = setdiff(1:U,u);
@@ -125,7 +128,6 @@ for t=1:L
         sinr_users(u,t) = sig_u/(interf_uU + interfI + sigma_n);
     end
 end
-if P.showProg, fprintf('\n'); end
 end
 
 function s = steeringVector(theta,N,d,lambda)
@@ -144,7 +146,7 @@ for p=1:np
     phn = exp(1i*pn*randn(N,1));
     h_sum = h_sum + a.*phn;
 end
-h = C*(h_sum/max(sqrt(np),1));
+h = C * (h_sum / sqrt(np));
 end
 
 function plotBeamPattern(w,N,d,lambda,thetaU,thetaI,idx)
@@ -155,13 +157,21 @@ figure; plot(th,B,'LineWidth',1.2); grid on; xlim([-90 90]); ylim([-60 0]); hold
 plot(thetaU(idx),-3,'go','MarkerSize',10,'MarkerFaceColor','g');
 oth = setdiff(1:numel(thetaU),idx);
 if ~isempty(oth), plot(thetaU(oth),-3*ones(size(oth)),'b^','MarkerSize',8); end
-plot(thetaI,-20*ones(size(thetaI)),'rv','MarkerSize',8);
+if ~isempty(thetaI), plot(thetaI,-20*ones(size(thetaI)),'rv','MarkerSize',8); end
 [~,ix] = max(B); plot(th(ix),B(ix),'gs','MarkerSize',10,'MarkerFaceColor','g');
 xlabel('Angle (deg)'); ylabel('Gain (dB)'); title('Max-SINR Beam');
 if isempty(oth)
-    legend('|w^H s(\\theta)| (dB)','Desired user','Interferers','Beam peak','Location','best');
+    if isempty(thetaI)
+        legend('|w^H s(\theta)|','Desired user','Beam peak','Location','best');
+    else
+        legend('|w^H s(\theta)|','Desired user','Interferers','Beam peak','Location','best');
+    end
 else
-    legend('|w^H s(\\theta)| (dB)','Desired user','Other users','Interferers','Beam peak','Location','best');
+    if isempty(thetaI)
+        legend('|w^H s(\theta)|','Desired user','Other users','Beam peak','Location','best');
+    else
+        legend('|w^H s(\theta)|','Desired user','Other users','Interferers','Beam peak','Location','best');
+    end
 end
 hold off
 end
