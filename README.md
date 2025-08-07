@@ -1,1 +1,1 @@
-Multi-User Beamforming With Interference Suppression for Large-Scale Arrays
+Graph-Regularized Beamforming for Enhanced Interference Control in Antenna Arrays
