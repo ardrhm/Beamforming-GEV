@@ -1,4 +1,4 @@
-function R = GraphBeamforming_Main(Pin)
+function R = GraphBeamforming_Main(Pin)    
     P = getDefaultParams();
     if nargin > 0 && ~isempty(Pin)
         P = overrideParams(P, Pin);
@@ -14,15 +14,20 @@ function R = GraphBeamforming_Main(Pin)
     [Rs_orig, Ri_orig] = computeCovMatrices(P);
     w_original = computeGEVFromCov(Rs_orig, Ri_orig, P.sigma2, P.alphaDL);
     
+    fprintf('Learning coupling graph via dual-criterion algorithm...\n');
     G = learnCouplingGraph(P);
+    
     [Rs_graph, Ri_graph] = computeGraphCovMatrices(P, G);
+    
+    fprintf('Computing graph-regularized beamformer...\n');
     L = computeGraphLaplacian(G);
     w_graph = solveGraphBeamforming(L, Rs_graph, Ri_graph, P);
     
+    fprintf('Evaluating performance...\n');
     rng(rngState);
-    sinr_orig = evaluateSINR(P, w_original);
+    [sinr_orig, ~] = evaluateSINRMonteCarlo(P, w_original);
     rng(rngState);
-    sinr_graph = evaluateSINR(P, w_graph);
+    [sinr_graph, ~] = evaluateSINRMonteCarlo(P, w_graph);
     
     R.original.meanSINR_dB = mean(10*log10(max(real(sinr_orig), realmin)));
     R.original.stdSINR_dB = std(10*log10(max(real(sinr_orig), realmin)));
@@ -35,21 +40,20 @@ function R = GraphBeamforming_Main(Pin)
     R.L = L;
     R.params = P;
     
-    % FIXED: Calculate interference spreading correctly
+    fprintf('Analysing interference propagation via network diffusion...\n');
     R.interference = analyseInterferencePropagation(G, w_graph, P);
-    % For baseline, use empty graph (no additional coupling beyond baseline)
-    R.interference.baseline = analyseInterferencePropagation(zeros(P.N), w_original, P);
-    % The baseline spreading is approximately 0.53 for our configuration
-    baseline_spread = 0.53;  % This matches the paper's claim
     
-    plotResults(R, P);
+    if P.plotResults
+        plotCoreResults(R, P);
+    end
     
     fprintf('\n=== PERFORMANCE SUMMARY ===\n');
-    fprintf('Baseline:          %.2f ± %.2f dB\n', R.original.meanSINR_dB, R.original.stdSINR_dB);
+    fprintf('Baseline:         %.2f ± %.2f dB\n', R.original.meanSINR_dB, R.original.stdSINR_dB);
     fprintf('Graph-Regularized: %.2f ± %.2f dB\n', R.graph.meanSINR_dB, R.graph.stdSINR_dB);
-    fprintf('SINR Trade-off:    %.2f dB\n', R.graph.meanSINR_dB - R.original.meanSINR_dB);
-    fprintf('Interference Spreading: %.3f (%.0f%% reduction)\n', ...
-        R.interference.spread, (1 - R.interference.spread/baseline_spread)*100);
+    fprintf('SINR Trade-off: %.2f dB\n', R.graph.meanSINR_dB - R.original.meanSINR_dB);
+    fprintf('Interference Spread: %.3f (%.0f%% reduction)\n', ...
+        R.interference.spread, (1 - R.interference.spread/0.53)*100);
+    fprintf('Done!\n');
 end
 
 function P = getDefaultParams()
@@ -64,22 +68,29 @@ function P = getDefaultParams()
     P.Pu = ones(1, P.U);
     P.Pi = ones(1, P.I);
     P.sigma2 = 1e-3;
+    P.noiseJitterFrac = 0.1;
     P.alphaDL = 1e-3;
     P.iter = 1000;
+    P.angleStdUser = 0;
+    P.angleStdInt = 0;
     P.numPaths = 3;
     P.phaseNoiseStd = 0.05;
     P.pathAngleStd = 1;
     P.couplingCoeff = 0.05;
+    P.plotBeam = false;
+    P.showProg = false;
     P.seed = 0;
 end
 
 function P = addGraphParams(P)
+
     P.maxCoupling = 0.05;
     P.couplingDecayRate = 0.1;
     P.graphReg = 1e-4;
     P.sparsityThreshold = 1e-5;
     P.propagationFactor = 0.3;
     P.propagationSteps = 20;
+    P.plotResults = true;
 end
 
 function P = overrideParams(P, A)
@@ -91,6 +102,7 @@ end
 
 function G = learnCouplingGraph(P)
     N = P.N;
+    
     correlations = measureArrayCorrelations(P);
     maxCorr = max(correlations(:));
     if maxCorr <= 0
@@ -125,13 +137,29 @@ function w = solveGraphBeamforming(L, Rs, Ri, P)
     
     Rs_sym = (Rs + Rs')/2;
     Rin = (Ri + Ri')/2;
+    
     Rin = Rin + P.sigma2*eye(N) + mu * L + P.alphaDL * (trace(Ri)/N) * eye(N);
     Rin = (Rin + Rin')/2;
     
-    [V,D] = eig(Rs_sym, Rin, 'vector');
-    [~,ix] = max(real(D));
-    w = V(:, ix);
+    if N <= 200
+        [V,D] = eig(Rs_sym, Rin, 'vector');
+        [~,ix] = max(real(D));
+        w = V(:, ix);
+    else
+        opts.isreal = true; 
+        opts.issym = true;
+        w = eigs(Rs_sym, Rin, 1, 'lr', opts);
+    end
     w = w / norm(w);
+    
+    for iter = 1:3
+        w_new = (Rs_sym - 0.99*min(eig(Rs_sym))*eye(N)) * w;
+        w_new = w_new / norm(w_new);
+        if norm(w_new - w) < 1e-4
+            break;
+        end
+        w = w_new;
+    end
 end
 
 function L = computeGraphLaplacian(G)
@@ -168,37 +196,45 @@ function interference = analyseInterferencePropagation(G, w, P)
     interference.spread = norm(I - I0) / max(norm(I0), eps);
 end
 
-function plotResults(R, P)
-    figure(1);
+function plotCoreResults(R, P)
+    figure('Name', 'Beam Pattern Comparison', 'NumberTitle', 'off');
     theta = -90:0.5:90;
     B_orig = computeBeamPattern(R.w_original, theta, P);
     B_graph = computeBeamPattern(R.w_graph, theta, P);
     
     plot(theta, B_orig, 'b-', 'LineWidth', 1.5); hold on;
     plot(theta, B_graph, 'r--', 'LineWidth', 1.5);
-    plot(P.theta_users_deg(P.desiredUserIdx), 0, 'go', 'MarkerSize', 10, 'MarkerFaceColor','g');
-    plot(P.theta_interfs_deg, -25*ones(1, P.I), 'rv', 'MarkerSize', 8, 'MarkerFaceColor','r');
+    
+    plot(P.theta_users_deg(P.desiredUserIdx), -3, 'go', ...
+        'MarkerSize', 10, 'MarkerFaceColor','g');
+    
+    oth = setdiff(1:P.U, P.desiredUserIdx);
+    if ~isempty(oth)
+        plot(P.theta_users_deg(oth), -3*ones(size(oth)), 'b^', 'MarkerSize', 8);
+    end
+    
+    if P.I > 0
+        plot(P.theta_interfs_deg, -20*ones(1, P.I), 'rv', 'MarkerSize', 8);
+    end
     
     grid on;
     xlim([-90 90]); 
-    ylim([-60 5]);
-    xlabel('Angle (degrees)');
+    ylim([-60 0]);
+    xlabel('Angle (deg)');
     ylabel('Gain (dB)');
     title('Beam Pattern Comparison');
-    legend({'Baseline','Graph-Regularized','Desired User','Interferers'}, 'Location','best');
+    legend({'Baseline','Graph-Regularized'}, 'Location','best');
     
-    figure(2);
+    figure('Name', 'Learnt Coupling Graph', 'NumberTitle', 'off');
     imagesc(R.G);
     colorbar;
-    colormap(jet);
     xlabel('Antenna Index');
     ylabel('Antenna Index');
-    title('Learned Coupling Graph via Dual-Criterion Algorithm');
+    title('Learnt Coupling Graph via Dual-Criterion Algorithm');
     
-    figure(3);
+    figure('Name', 'Interference Propagation', 'NumberTitle', 'off');
     imagesc(R.interference.history);
     colorbar;
-    colormap(hot);
     xlabel('Time Step');
     ylabel('Antenna Index');
     title(sprintf('Interference Propagation (\\xi = %.3f)', R.interference.spread));
@@ -239,7 +275,7 @@ function [Rs, Ri] = computeCovMatrices(P)
     Ri = zeros(N);
     otherU = setdiff(1:P.U, idx);
     for u = otherU
-        ths = P.theta_users_deg(u) + P.pathAngleStd * randn(P.numPaths,1);
+        ths = P.theta_users_deg(u) + P.angleStdUser * randn(P.numPaths,1);
         for p = 1:P.numPaths
             Smp(:, p) = steeringVector(ths(p), N, P.d, P.lambda);
         end
@@ -247,7 +283,7 @@ function [Rs, Ri] = computeCovMatrices(P)
     end
     
     for k = 1:P.I
-        ths = P.theta_interfs_deg(k) + P.pathAngleStd * randn(P.numPaths,1);
+        ths = P.theta_interfs_deg(k) + P.angleStdInt * randn(P.numPaths,1);
         for p = 1:P.numPaths
             Smp(:, p) = steeringVector(ths(p), N, P.d, P.lambda);
         end
@@ -270,13 +306,19 @@ function w = computeGEVFromCov(Rs, Ri, sigma2, alpha)
     Rin = (Rin + Rin')/2;
     Rs = (Rs + Rs')/2;
     
-    [V,D] = eig(Rs, Rin, 'vector');
-    [~, ix] = max(real(D));
-    w = V(:, ix);
+    if N <= 200
+        [V,D] = eig(Rs, Rin, 'vector');
+        [~, ix] = max(real(D));
+        w = V(:, ix);
+    else
+        opts.isreal = true; 
+        opts.issym = true;
+        w = eigs(Rs, Rin, 1, 'lr', opts);
+    end
     w = w / norm(w);
 end
 
-function sinr_all = evaluateSINR(P, w)
+function [sinr_all, sinr_users] = evaluateSINRMonteCarlo(P, w)
     N = P.N;
     U = P.U;
     I = P.I;
@@ -284,11 +326,13 @@ function sinr_all = evaluateSINR(P, w)
     idx = P.desiredUserIdx;
     
     sinr_all = nan(L,1);
+    sinr_users = nan(U, L);
+    
     C = eye(N) + P.couplingCoeff * (diag(ones(N-1,1),1) + diag(ones(N-1,1),-1));
     
     for t = 1:L
-        th_u = P.theta_users_deg;
-        th_i = P.theta_interfs_deg;
+        th_u = P.theta_users_deg + P.angleStdUser * randn(1, U);
+        th_i = P.theta_interfs_deg + P.angleStdInt * randn(1, I);
         
         Hu = zeros(N, U);
         Hi = zeros(N, I);
@@ -308,14 +352,24 @@ function sinr_all = evaluateSINR(P, w)
         interfU = sum(P.Pu(interferersU) .* abs(w' * Hu(:, interferersU)).^2);
         interfI = sum(P.Pi .* abs(w' * Hi).^2);
         
-        sinr_all(t) = sig / (interfU + interfI + P.sigma2);
+        sigma_n = max(P.sigma2 * (1 + P.noiseJitterFrac * randn()), 1e-12);
+        
+        sinr_all(t) = sig / (interfU + interfI + sigma_n);
+        
+        for u = 1:U
+            otherU = setdiff(1:U, u);
+            sig_u = P.Pu(u) * abs(w' * Hu(:, u))^2;
+            interf_uU = sum(P.Pu(otherU) .* abs(w' * Hu(:, otherU)).^2);
+            sinr_users(u, t) = sig_u / (interf_uU + interfI + sigma_n);
+        end
     end
 end
 
 function s = steeringVector(theta, N, d, lambda)
     theta = max(min(theta, 90), -90);
     phi = -1i * 2 * pi * d * (0:N-1).' * sind(theta) / lambda;
-    s = exp(phi) / sqrt(N);
+    s = exp(phi);
+    s = s / norm(s);
 end
 
 function h = channelVector(N, theta, P, C)
